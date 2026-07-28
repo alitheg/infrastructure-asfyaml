@@ -485,6 +485,8 @@ github:
     - gstein
 ~~~
 
+**An invite will be sent, and they must accept the invitation before they appear in the GitHub list.**
+
 To remove people as collaborators, remove them from the list. You may only have ten active collaborators at any given time per repository. If you need more, ask `vp-infra@apache.org` for an exception.
 
 **Note**: If you wish to completely empty a previously non-empty list of collaborators, explicitly specify an empty list:
