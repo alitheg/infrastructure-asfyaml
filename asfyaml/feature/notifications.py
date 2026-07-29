@@ -56,17 +56,16 @@ VALID_NOTIFICATION_SCHEMES = [
 
 # These are the only valid targets for private repo events
 VALID_PRIVATE_TARGETS = [
-    "private@*",
     "security@*",
     "security-notifications@*",
     "commits@infra.apache.org",
     "notifications@infra.apache.org",
     "issues@infra.apache.org",
-    "private-commits@*",
+    "*private*@*",  # covers private@foo, commits-private@foo, private-commits@foo, etc.
 ]
 
 # regex for valid ASF mailing list
-RE_VALID_MAILING_LIST = re.compile(r"[-a-z0-9]+@([-a-z0-9]+\.)?(incubator\.)?apache\.org$")
+RE_VALID_MAILING_LIST = re.compile(r"[-a-z0-9]+@(?:[-a-z0-9]+\.)?(?:(?:incubator\.)?apache\.org|apachecon\.com)$")
 
 
 class ASFNotificationsFeature(ASFYamlFeature, name="notifications", priority=0):
