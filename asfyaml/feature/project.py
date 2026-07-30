@@ -16,6 +16,7 @@
 # under the License.
 
 import json
+import time
 from urllib.parse import urlparse
 
 import requests
@@ -36,6 +37,21 @@ ATR_CONFIG_PATH = "/x1/gitbox/auth/atr.json"
 # ATR mints system JWTs against a fixed service identity, so the uid we send at exchange
 # time must match its SYSTEM_SERVICE_UID — it comes back as the subject of the JWT.
 _ATR_SYSTEM_UID = "system"
+
+# ATR hands back a 5xx while it's restarting or momentarily overloaded. Those are
+# transient, so rather than bounce the push over one, give ATR a few moments and try
+# again before giving up. Deliberately short: this runs synchronously inside the git
+# hook, so we can't sit here for minutes waiting on it.
+_ATR_RETRY_STATUSES = frozenset({502, 503, 504})
+_ATR_RETRY_ATTEMPTS = 4
+_ATR_RETRY_BACKOFF_SECONDS = 5
+
+# A redeploy can also surface as a plain 500 rather than one of the codes above. While the
+# backend restarts, the reverse proxy in front of it can't finish the SSL handshake upstream
+# and serves its own "500 Proxy Error" HTML page. That's the same transient restart wearing a
+# different status, so a 500 carrying this signature is retryable too — but only that shape: a
+# genuine ATR 500 comes back as JSON and still bounces, so we don't hammer real errors.
+_ATR_PROXY_ERROR_MARKERS = ("Proxy Error", "Error during SSL Handshake")
 
 _METADATA_SCHEMA = strictyaml.Map(
     {
@@ -62,6 +78,31 @@ _METADATA_SCHEMA = strictyaml.Map(
         strictyaml.Optional("standards"): strictyaml.Seq(strictyaml.Str()),
         strictyaml.Optional("categories"): strictyaml.Seq(strictyaml.Str()),
         strictyaml.Optional("programming_languages"): strictyaml.Seq(strictyaml.Str()),
+        # Version scheme. Changing any of these makes ATR reassign existing releases to
+        # whichever cycle their version string now maps to. A calver project describes its
+        # cycles with calver_format and ATR compiles cycle_match from it; everything else
+        # sets cycle_match directly.
+        strictyaml.Optional("version_method"): strictyaml.Enum(["simple", "semver", "calver"]),
+        strictyaml.Optional("version_pattern"): strictyaml.Str(),
+        strictyaml.Optional("cycle_match"): strictyaml.Str(),
+        strictyaml.Optional("calver_format"): strictyaml.Str(),
+        strictyaml.Optional("branch_template"): strictyaml.Str(),
+    }
+)
+
+# Fields with no DOAP equivalent, so a project that takes the rest from a DOAP file
+# still authors these here.
+_NON_DOAP_FIELDS = frozenset(
+    {
+        "lifecycle_page",
+        "security_contact",
+        "threat_model_link",
+        "threat_model_src_link",
+        "version_method",
+        "version_pattern",
+        "cycle_match",
+        "calver_format",
+        "branch_template",
     }
 )
 
@@ -138,7 +179,10 @@ class ASFATRFeature(ASFYamlFeature, name="project", env="production", priority=5
                 security_contact: security@apache.org   # or security@<committee>.apache.org
                 threat_model_link: https://foo.apache.org/security/threat-model
                 threat_model_src_link: https://github.com/apache/foo/blob/main/THREATS.md
-                # ...or, instead of the fields above, point at a DOAP file:
+                version_method: calver      # simple (default), semver or calver
+                calver_format: "(YY.MM).N"  # calver only; ATR compiles cycle_match from it
+                # ...or, instead of the fields above, point at a DOAP file. The ATR-only
+                # fields (security, threat model, version scheme) can still sit alongside it:
                 doap: https://foo.apache.org/doap.rdf
               policy:
                 vote_recipients:
@@ -166,10 +210,12 @@ class ASFATRFeature(ASFYamlFeature, name="project", env="production", priority=5
         repo_name = self.repository.name
         if repo_name != committee_key and not repo_name.startswith(f"{committee_key}-"):
             raise Exception(f"committee '{committee_key}' does not match repository name '{repo_name}'")
-        # A DOAP file, if given, is the authoritative source for the project fields.
+        # A DOAP file, if given, is the authoritative source for the project fields it can
+        # express. The ATR-only fields, which DOAP has no vocabulary for, stay as authored.
         doap_url = metadata.pop("doap", None)
         if doap_url:
-            metadata = _parse_doap(doap_url)
+            local = {key: value for key, value in metadata.items() if key in _NON_DOAP_FIELDS}
+            metadata = _parse_doap(doap_url) | local
         payload = {
             "project_key": project_key,
             "committee_key": committee_key,
@@ -192,7 +238,7 @@ class ASFATRFeature(ASFYamlFeature, name="project", env="production", priority=5
             "Content-Type": "application/json",
         }
         print(f"[project] POST {url} for project {project_key}")
-        resp = requests.post(url, json=payload, headers=headers, timeout=30)
+        resp = _post_with_retry(url, json=payload, headers=headers, timeout=30)
         if not resp.ok:
             # Surface the API's error body — it's the most useful thing to put in the bounce email.
             raise Exception(f"ATR API call failed ({resp.status_code}): {resp.text}")
@@ -208,13 +254,46 @@ def _load_config(path: str) -> dict:
     return config
 
 
+def _post_with_retry(url: str, **kwargs):
+    """POST to ATR, retrying the transient 5xx codes it returns while it's unavailable.
+
+    Returns the final response either way — the caller still checks resp.ok, so a real
+    4xx (or a 5xx that never clears within our budget) bounces exactly as before, just
+    after we've given ATR a chance to come back.
+    """
+    for attempt in range(1, _ATR_RETRY_ATTEMPTS + 1):
+        resp = requests.post(url, **kwargs)
+        if not _is_transient(resp) or attempt == _ATR_RETRY_ATTEMPTS:
+            return resp
+        print(
+            f"[project] ATR returned {resp.status_code}, retrying in {_ATR_RETRY_BACKOFF_SECONDS}s "
+            f"(attempt {attempt}/{_ATR_RETRY_ATTEMPTS})"
+        )
+        time.sleep(_ATR_RETRY_BACKOFF_SECONDS)
+
+
+def _is_transient(resp) -> bool:
+    """Whether a failed response looks like a restart blip worth another attempt.
+
+    The 5xx codes ATR emits while restarting are always retryable. A 500 is retryable only
+    when it's the fronting proxy's SSL-handshake error page — the shape a redeploy produces
+    while the backend has no TLS listener yet. A real ATR 500 comes back as JSON, so it has
+    neither the proxy markers nor an HTML content type, and bounces exactly as before.
+    """
+    if resp.status_code in _ATR_RETRY_STATUSES:
+        return True
+    if resp.status_code == 500 and "json" not in resp.headers.get("Content-Type", "").lower():
+        return any(marker in resp.text for marker in _ATR_PROXY_ERROR_MARKERS)
+    return False
+
+
 def _exchange_token_for_jwt(base_url: str, token: str) -> str:
     """Swap the configured system PAT for a short-lived ATR JWT.
 
     /project/config is gated to system bearer tokens, and ATR issues those JWTs via
     /api/jwt/create.
     """
-    resp = requests.post(
+    resp = _post_with_retry(
         f"{base_url}/api/jwt/create",
         json={"asfuid": _ATR_SYSTEM_UID, "pat": token},
         timeout=30,
