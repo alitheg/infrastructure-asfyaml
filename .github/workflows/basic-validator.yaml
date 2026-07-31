@@ -14,7 +14,7 @@ env:
 jobs:
   # Build and run tests with a range of python versions.
   build:
-    runs-on: ubuntu-latest
+    runs-on: runs-on=${{ github.run_id }}/runner=2cpu-linux-x64/tag=infra
     strategy:
       max-parallel: 4
       matrix:
