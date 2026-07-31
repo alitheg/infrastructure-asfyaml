@@ -133,6 +133,9 @@ project:
       - build-management
     programming_languages:
       - python
+    version_method: semver
+    version_pattern: '^\d+\.\d+\.\d+$'
+    cycle_match: '^(\d+)\.\d+\.\d+$'
   policy:
     vote_recipients:
       to: private@tooling.apache.org
@@ -145,6 +148,27 @@ project:
 ~~~
 
 `security_contact`, if set, must be either `security@apache.org` or `security@<committee>.apache.org`. The two threat-model fields are URLs: `threat_model_link` points at the published threat model, and `threat_model_src_link` at its source.
+
+The version-scheme fields tell ATR how your version strings decompose into release cycles. Changing any of them lets ATR assign existing releases to whichever cycle their version now maps to, enabling lifecycle management features.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `version_method` | `simple`, `semver` or `calver` | How version strings are interpreted. Defaults to `simple`. |
+| `version_pattern` | regex | Validates a release version string. |
+| `cycle_match` | regex | Groups versions into cycles; the first capture group is the cycle key. |
+| `calver_format` | date format | For `calver` projects only. Describes the version shape as a date format (e.g. `(YY.MM).N`); ATR compiles `cycle_match` from it, so set one or the other, not both. |
+| `branch_template` | string | Names the release branch per cycle, e.g. `release-{cycle}`. |
+
+A calver project sets `version_method: calver` and `calver_format` instead of `cycle_match`:
+
+~~~yaml
+project:
+  metadata:
+    key: tooling-trusted-releases
+    committee: tooling
+    version_method: calver
+    calver_format: "(YY.MM).N"
+~~~
 
 Alternatively, if you already have a DOAP file and want to continue to use it as the main source of project data, you can link the DOAP file into ATR like this:
 
@@ -166,6 +190,8 @@ project:
 ~~~
 
 Note that in this case, for security reasons: you must use https, your link must live under apache.org or raw.githubusercontent.com/apache, and HTTP redirects will not be followed. (A `github.com/apache/...` link redirects to `raw.githubusercontent.com`, so link directly to the raw file as shown above.)
+
+DOAP has no vocabulary for the ATR-only fields — `lifecycle_page`, the security fields, and the version-scheme fields. If you set any of those alongside a `doap:` link, they are kept as authored; the DOAP file supplies only the fields it can express.
 
 <h3 id="policy">Release policy</h3>
 
@@ -205,7 +231,7 @@ The remaining fields:
 | `source_excludes_rat` | list of globs | Paths excluded from the RAT license check. |
 | `file_tag_mappings` | map of label to globs | Groups release files under named tags. |
 | `release_checklist` | string | Checklist shown to release managers. |
-| `download_path_suffix` | string | Subdirectory the release is published under. A per-release template that may use `{{PROJECT_KEY}}` and `{{VERSION}}`. |
+| `download_path_suffix` | string | Subdirectory the release is published under. A per-release template that may use `{{PROJECT_KEY}}`, `{{VERSION}}` and `{{MAJOR_VERSION}}`. |
 | `start_vote_subject` / `start_vote_template` | string | Subject and body for the vote-start email. |
 | `vote_comment_template` | string | Template for vote comments. |
 | `finish_vote_template` | string | Template for the vote-result email. |
@@ -218,11 +244,11 @@ The remaining fields:
 
 By default, your project definition will be synchronized to ATR. If you wish to opt out of this, setting `atr_sync: false` will allow you to define the values but opt-out of the sync process.
 
-When sync is _enabled_, you will be unable to edit the values manually in ATR. The .asf.yaml file will be the authoritative source of project metadata.
+When sync is _enabled_, the .asf.yaml file is the authoritative source of project metadata. You can still edit the values manually in ATR, but the next push from your default branch will overwrite those edits with what the .asf.yaml file says.
 
 <h4 id="atrinit">Initial values from ATR</h4>
 
-ATR seeds the metadata from Whimsy and LDAP. If you want to move the definition into your .asf.yaml file, you can export the yaml from ATR by using the export function on the project metadata page.
+ATR seeds the metadata from the foundation's own project data at `projects.apache.org` (the same DOAP-derived data a `doap:` link re-imports), with committee membership from Whimsy. If you want to move the definition into your .asf.yaml file, you can export the yaml from ATR by using the export function on the project metadata page.
 
 <h2 id="notif">Notification settings for repositories</h2>
 

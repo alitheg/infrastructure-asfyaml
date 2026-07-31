@@ -23,7 +23,14 @@ import pytest
 
 import asfyaml.asfyaml
 import asfyaml.dataobjects
-from asfyaml.feature.project import _doap_metadata, _exchange_token_for_jwt, _parse_doap, _validate_doap_url
+from asfyaml.feature.project import (
+    _doap_metadata,
+    _exchange_token_for_jwt,
+    _is_transient,
+    _parse_doap,
+    _post_with_retry,
+    _validate_doap_url,
+)
 from helpers import YamlTest
 
 # The ATR project's own description, reused across the DOAP fixture and assertions.
@@ -208,6 +215,21 @@ project:
 """,
 )
 
+# A calver project describes its cycles with a date format under metadata.
+valid_calver_metadata = YamlTest(
+    None,
+    None,
+    """
+project:
+    metadata:
+        key: tooling-trusted-releases
+        committee: tooling
+        name: Apache Trusted Releases
+        version_method: calver
+        calver_format: "(YY.MM).N"
+""",
+)
+
 # vote_mode only accepts manual/email/trusted
 invalid_bad_vote_mode = YamlTest(
     asfyaml.asfyaml.ASFYAMLException,
@@ -246,6 +268,7 @@ def test_schema_validation(test_repo: asfyaml.dataobjects.Repository):
         valid_metadata,
         valid_metadata_with_policy,
         valid_full_policy,
+        valid_calver_metadata,
         valid_metadata_with_doap,
         valid_security_and_download_suffix,
         invalid_missing_metadata,
@@ -545,6 +568,66 @@ project:
     assert payload["policy"]["download_path_suffix"] == "tesettest"
 
 
+def test_noop_payload_carries_version_scheme(atr_repo: asfyaml.dataobjects.Repository, capsys):
+    yaml = """
+project:
+    metadata:
+        key: tooling
+        committee: tooling
+        name: Apache Tooling
+        version_method: calver
+        calver_format: "(YY.MM).N"
+"""
+    a = asfyaml.asfyaml.ASFYamlInstance(
+        repo=atr_repo, committer="arm", config_data=yaml, branch=asfyaml.dataobjects.DEFAULT_BRANCH
+    )
+    a.environments_enabled.add("noop")
+    a.no_cache = True
+    a.run_parts()
+
+    out = capsys.readouterr().out
+    project = json.loads(out[out.index("{") : out.rindex("}") + 1])["project"]
+    # The version scheme rides along in the project block, alongside the DOAP-style fields.
+    assert project["version_method"] == "calver"
+    assert project["calver_format"] == "(YY.MM).N"
+
+
+def test_noop_payload_doap_keeps_atr_only_fields(atr_repo: asfyaml.dataobjects.Repository, capsys, monkeypatch):
+    class FakeResponse:
+        ok = True
+        is_redirect = False
+        content = SAMPLE_DOAP
+
+    monkeypatch.setattr(
+        "asfyaml.feature.project.requests.get", lambda url, timeout=None, allow_redirects=True: FakeResponse()
+    )
+    yaml = """
+project:
+    metadata:
+        key: tooling
+        committee: tooling
+        doap: https://tooling.apache.org/doap.rdf
+        security_contact: security@apache.org
+        version_method: calver
+        calver_format: "(YY.MM).N"
+"""
+    a = asfyaml.asfyaml.ASFYamlInstance(
+        repo=atr_repo, committer="arm", config_data=yaml, branch=asfyaml.dataobjects.DEFAULT_BRANCH
+    )
+    a.environments_enabled.add("noop")
+    a.no_cache = True
+    a.run_parts()
+
+    out = capsys.readouterr().out
+    project = json.loads(out[out.index("{") : out.rindex("}") + 1])["project"]
+    # DOAP supplies the fields it can express...
+    assert project["name"] == "Apache Trusted Releases"
+    # ...while the ATR-only fields, which DOAP has no vocabulary for, survive from .asf.yaml.
+    assert project["security_contact"] == "security@apache.org"
+    assert project["version_method"] == "calver"
+    assert project["calver_format"] == "(YY.MM).N"
+
+
 def test_committee_matching_repo_prefix_is_accepted(atr_repo: asfyaml.dataobjects.Repository, capsys):
     # Repo "tooling-trusted-releases" accepts committee "tooling" (prefix before the hyphen).
     yaml = """
@@ -573,6 +656,7 @@ def test_exchange_token_for_jwt_posts_system_pat(monkeypatch):
 
     class FakeResponse:
         ok = True
+        status_code = 200
 
         @staticmethod
         def json():
@@ -596,9 +680,7 @@ def test_exchange_token_for_jwt_failure_raises(monkeypatch):
         status_code = 401
         text = "unauthorized"
 
-    monkeypatch.setattr(
-        "asfyaml.feature.project.requests.post", lambda url, json=None, timeout=None: FakeResponse()
-    )
+    monkeypatch.setattr("asfyaml.feature.project.requests.post", lambda url, json=None, timeout=None: FakeResponse())
     with pytest.raises(Exception, match="ATR token exchange failed"):
         _exchange_token_for_jwt("https://atr.example", "bad-pat")
 
@@ -606,17 +688,90 @@ def test_exchange_token_for_jwt_failure_raises(monkeypatch):
 def test_exchange_token_for_jwt_missing_jwt_raises(monkeypatch):
     class FakeResponse:
         ok = True
+        status_code = 200
         text = '{"asfuid": "system"}'
 
         @staticmethod
         def json():
             return {"asfuid": "system"}
 
-    monkeypatch.setattr(
-        "asfyaml.feature.project.requests.post", lambda url, json=None, timeout=None: FakeResponse()
-    )
+    monkeypatch.setattr("asfyaml.feature.project.requests.post", lambda url, json=None, timeout=None: FakeResponse())
     with pytest.raises(Exception, match="returned no JWT"):
         _exchange_token_for_jwt("https://atr.example", "the-system-pat")
+
+
+class _FakeResp:
+    """Minimal stand-in for a requests.Response, enough for the retry helpers."""
+
+    def __init__(self, status_code, *, text="", content_type=""):
+        self.status_code = status_code
+        self.text = text
+        self.headers = {"Content-Type": content_type} if content_type else {}
+        self.ok = status_code < 400
+
+
+# A redeploy's proxy 500: httpd's SSL-handshake error page while the backend has no TLS listener.
+_PROXY_500 = _FakeResp(
+    500,
+    text=(
+        "<html><head><title>500 Proxy Error</title></head>"
+        "<body><h1>Proxy Error</h1>Error during SSL Handshake with remote server</body></html>"
+    ),
+    content_type="text/html; charset=iso-8859-1",
+)
+
+
+def test_is_transient_classification():
+    # The 5xx codes ATR emits while restarting, plus the proxy's SSL-handshake 500, are transient.
+    assert _is_transient(_FakeResp(503, text="unavailable")) is True
+    assert _is_transient(_FakeResp(502, text="bad gateway")) is True
+    assert _is_transient(_PROXY_500) is True
+    # A genuine ATR 500 comes back as JSON, and a 4xx is a real rejection — neither is retried.
+    assert _is_transient(_FakeResp(500, text='{"error": "boom"}', content_type="application/json")) is False
+    assert _is_transient(_FakeResp(500, text="mystery html", content_type="text/html")) is False
+    assert _is_transient(_FakeResp(400, text="bad request")) is False
+
+
+def _sequence_poster(monkeypatch, responses):
+    """Wire requests.post to hand back `responses` in order, and skip the real backoff sleeps."""
+    calls = {"n": 0}
+
+    def fake_post(url, **kwargs):
+        resp = responses[calls["n"]]
+        calls["n"] += 1
+        return resp
+
+    monkeypatch.setattr("asfyaml.feature.project.requests.post", fake_post)
+    monkeypatch.setattr("asfyaml.feature.project.time.sleep", lambda _s: None)
+    return calls
+
+
+def test_post_with_retry_recovers_from_proxy_500(monkeypatch):
+    # The redeploy's proxy 500 clears once the backend is back, so the retry gets through.
+    ok = _FakeResp(200, text='{"success": true}', content_type="application/json")
+    calls = _sequence_poster(monkeypatch, [_PROXY_500, ok])
+    resp = _post_with_retry("https://atr.example/api/jwt/create")
+    assert resp.status_code == 200
+    assert calls["n"] == 2  # bounced off the proxy 500, then succeeded
+
+
+def test_post_with_retry_recovers_from_503(monkeypatch):
+    ok = _FakeResp(200, text="ok", content_type="application/json")
+    calls = _sequence_poster(monkeypatch, [_FakeResp(503, text="unavailable"), ok])
+    resp = _post_with_retry("https://atr.example/api/jwt/create")
+    assert resp.status_code == 200
+    assert calls["n"] == 2
+
+
+def test_post_with_retry_bounces_atr_json_500_immediately(monkeypatch):
+    # A real ATR 500 isn't a restart blip; it should fail on the first try, not burn the budget.
+    calls = _sequence_poster(
+        monkeypatch,
+        [_FakeResp(500, text='{"error": "boom"}', content_type="application/json")],
+    )
+    resp = _post_with_retry("https://atr.example/api/project/config")
+    assert resp.status_code == 500
+    assert calls["n"] == 1  # no retry
 
 
 def test_committee_not_matching_repo_is_rejected(atr_repo: asfyaml.dataobjects.Repository):
