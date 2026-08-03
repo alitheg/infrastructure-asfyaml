@@ -59,6 +59,8 @@ VALID_PRIVATE_TARGETS = [
     "security@*",
     "security-notifications@*",
     "commits@infra.apache.org",
+    "notifications@infra.apache.org",
+    "issues@infra.apache.org",
     "*private*@*",  # covers private@foo, commits-private@foo, private-commits@foo, etc.
 ]
 
