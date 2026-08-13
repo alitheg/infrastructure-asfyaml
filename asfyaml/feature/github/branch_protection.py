@@ -85,8 +85,9 @@ query($endCursor: String, $organization: String!, $repository: String!, $refPref
 
 @directive
 def branch_protection(self: ASFGitHubFeature):
-    # Branch protections
-    if "protected_branches" not in self.yaml:
+    # Skip reconfiguration if neither the previous nor the present file contained `protected_branches`.
+    previous_yaml = self.previous_yaml if isinstance(self.previous_yaml, dict) else {}
+    if "protected_branches" not in self.yaml and "protected_branches" not in previous_yaml:
         return
 
     # Collect all branches and whether they have active branch protection rules

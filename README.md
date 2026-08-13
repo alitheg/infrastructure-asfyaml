@@ -664,6 +664,11 @@ github:
   protected_branches: ~
 ~~~
 
+Removing the `protected_branches` section entirely has the same effect, provided the `github:` section still
+contains other configuration: the previously configured branch protection rules are then removed. Note that
+classic branch protection rules and [rulesets](#rulesets) can be active at the same time; GitHub evaluates both
+and applies the most restrictive result.
+
 <h3 id="customsubject">Custom subject lines for GitHub events</h3>
 
 You can customize the subject lines for GitHub events (issues and pull requests being opened, closed, and commented on) on a per-repository basis.
