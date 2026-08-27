@@ -230,7 +230,7 @@ class ASFATRFeature(ASFYamlFeature, name="project", env="production", priority=5
             return
 
         config = _load_config(ATR_CONFIG_PATH)
-        base_url = config["url"].rstrip("/")
+        base_url = "https://releases.apache.org"
         jwt = _exchange_token_for_jwt(base_url, config["token"])
         url = f"{base_url}/api/project/config"
         headers = {
